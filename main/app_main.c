@@ -1301,6 +1301,11 @@ void app_main()
 
     ESP_LOGI(TAG, "Allocating Frame Buffer memory...");
     currFbPtr=pvPortMallocCaps(320*240*2, MALLOC_CAP_32BIT);
+    if (currFbPtr == NULL) {
+        ESP_LOGE(TAG, "Not enough memory to allocate");
+        return;
+    }
+
     vTaskDelay(1000 / portTICK_RATE_MS);
     ESP_LOGI(TAG,"Starting nvs_flash_init");
     nvs_flash_init();
