@@ -409,6 +409,7 @@ static inline uint16_t fast_pascal_to_565(int Y, int U, int V) {
 
 //Warning: This gets squeezed into IRAM.
 volatile static uint32_t *currFbPtr __attribute__ ((aligned(4))) = NULL;
+volatile static uint32_t *currFbPtr2 __attribute__ ((aligned(4))) = NULL;
 
 inline uint8_t unpack(int byteNumber, uint32_t value) {
     return (value >> (byteNumber * 8));
@@ -1292,19 +1293,56 @@ static spi_device_interface_config_t devcfg={
     .pre_cb=ili_spi_pre_transfer_callback,  //Specify pre-transfer callback to handle D/C line
 };
 
-void app_main()
+
+// I (11781) ESPILICAM: Free heap: 214720
+// I (11781) ESPILICAM: Free (largest free blocks) 8bit-capable memory : 113804K, 32-bit capable memory 113804K
+// I (11781) ESPILICAM: Free (min free size) 8bit-capable memory : 212956K, 32-bit capable memory 272940K
+static void heap_mem_log()
 {
     size_t free8start, free32start, free8, free32;
 
+    #ifdef ESPIDFV21RC
+        free8=xPortGetFreeHeapSizeCaps(MALLOC_CAP_8BIT);
+        free32=xPortGetFreeHeapSizeCaps(MALLOC_CAP_32BIT);
+        free8start=xPortGetMinimumEverFreeHeapSizeCaps(MALLOC_CAP_8BIT);
+        free32start=xPortGetMinimumEverFreeHeapSizeCaps(MALLOC_CAP_32BIT);
+    #else
+        free32=heap_caps_get_largest_free_block(MALLOC_CAP_32BIT);
+        free8=heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        free8start=heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+        free32start=heap_caps_get_minimum_free_size(MALLOC_CAP_32BIT);
+    #endif
+
+    ESP_LOGI(TAG, "Free heap: %u", xPortGetFreeHeapSize());
+    ESP_LOGI(TAG, "Free (largest free blocks) 8bit-capable memory : %d, 32-bit capable memory %d", free8, free32);
+    ESP_LOGI(TAG, "Free (min free size) 8bit-capable memory : %d, 32-bit capable memory %d", free8start, free32start);
+}
+
+void app_main()
+{
     esp_log_level_set("wifi", ESP_LOG_WARN);
     esp_log_level_set("gpio", ESP_LOG_WARN);
 
-    ESP_LOGI(TAG, "Allocating Frame Buffer memory...");
-    currFbPtr=pvPortMallocCaps(320*240*2, MALLOC_CAP_32BIT);
+    heap_mem_log();
+    ESP_LOGI(TAG, "Allocating Frame Buffer 1 memory...");
+    // 320*240*2 = 153600
+    // heap_caps_malloc
+    currFbPtr=heap_caps_malloc(320*240*2, MALLOC_CAP_32BIT);
     if (currFbPtr == NULL) {
-        ESP_LOGE(TAG, "Not enough memory to allocate");
+        ESP_LOGE(TAG, "Not enough memory to allocate 1");
         return;
     }
+
+/*
+    heap_mem_log();
+    ESP_LOGI(TAG, "Allocating Frame Buffer 2 memory...");
+    currFbPtr2=heap_caps_malloc(320*240, MALLOC_CAP_32BIT);
+    if (currFbPtr2 == NULL) {
+        ESP_LOGE(TAG, "Not enough memory to allocate 2");
+        return;
+    }
+*/
+    heap_mem_log();
 
     vTaskDelay(1000 / portTICK_RATE_MS);
     ESP_LOGI(TAG,"Starting nvs_flash_init");
@@ -1365,22 +1403,7 @@ void app_main()
         return;
     }
 
-#ifdef ESPIDFV21RC
-    free8=xPortGetFreeHeapSizeCaps(MALLOC_CAP_8BIT);
-    free32=xPortGetFreeHeapSizeCaps(MALLOC_CAP_32BIT);
-    free8start=xPortGetMinimumEverFreeHeapSizeCaps(MALLOC_CAP_8BIT);
-    free32start=xPortGetMinimumEverFreeHeapSizeCaps(MALLOC_CAP_32BIT);
-#else
-    free32=heap_caps_get_largest_free_block(MALLOC_CAP_32BIT);
-    free8=heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    free8start=heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
-    free32start=heap_caps_get_minimum_free_size(MALLOC_CAP_32BIT);
-#endif
-
-    ESP_LOGI(TAG, "Free heap: %u", xPortGetFreeHeapSize());
-    ESP_LOGI(TAG, "Free (largest free blocks) 8bit-capable memory : %dK, 32-bit capable memory %dK\n", free8, free32);
-    ESP_LOGI(TAG, "Free (min free size) 8bit-capable memory : %dK, 32-bit capable memory %dK\n", free8start, free32start);
-
+    heap_mem_log();
 
     config.displayBuffer = currFbPtr;
     config.pixel_format = s_pixel_format;
@@ -1422,21 +1445,7 @@ void app_main()
 
     ESP_LOGI(TAG, "telnet to \"telnet " IPSTR "\" to access command console, type \"help\" for commands", IP2STR(&s_ip_addr));
 
-    #ifdef ESPIDFV21RC
-        free8=xPortGetFreeHeapSizeCaps(MALLOC_CAP_8BIT);
-        free32=xPortGetFreeHeapSizeCaps(MALLOC_CAP_32BIT);
-        free8start=xPortGetMinimumEverFreeHeapSizeCaps(MALLOC_CAP_8BIT);
-        free32start=xPortGetMinimumEverFreeHeapSizeCaps(MALLOC_CAP_32BIT);
-    #else
-        free32=heap_caps_get_largest_free_block(MALLOC_CAP_32BIT);
-        free8=heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-        free8start=heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
-        free32start=heap_caps_get_minimum_free_size(MALLOC_CAP_32BIT);
-    #endif
-
-    ESP_LOGI(TAG, "Free heap: %u", xPortGetFreeHeapSize());
-    ESP_LOGI(TAG, "Free (largest free blocks) 8bit-capable memory : %dK, 32-bit capable memory %dK\n", free8, free32);
-    ESP_LOGI(TAG, "Free (min free size) 8bit-capable memory : %dK, 32-bit capable memory %dK\n", free8start, free32start);
+    heap_mem_log();
 
     ESP_LOGI(TAG, "task stack: %d", uxTaskGetStackHighWaterMark(NULL));
 
