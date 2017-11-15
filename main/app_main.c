@@ -26,11 +26,8 @@
 #ifdef ESPIDFV21RC
   #include "esp_heap_alloc_caps.h"
 #else
-  #include "esp_heap_alloc_caps.h"
   #include "esp_heap_caps.h"
 #endif
-
-
 
 #include "esp_system.h"
 #include "esp_wifi.h"
@@ -38,9 +35,6 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
-#include "driver/spi_master.h"
-#include "soc/spi_reg.h"
-#include "driver/hspi.h"
 #include "soc/gpio_reg.h"
 #include "esp_attr.h"
 
@@ -58,213 +52,8 @@
 
 static const char* TAG = "ESPILICAM";
 
-/*
- This code displays some fancy graphics on the ILI9341-based 320x240 LCD on an ESP-WROVER_KIT board.
- It is not very fast, even when the SPI transfer itself happens at 8MHz and with DMA, because
- the rest of the code is not very optimized. Especially calculating the image line-by-line
- is inefficient; it would be quicker to send an entire screenful at once. This example does, however,
- demonstrate the use of both spi_device_transmit as well as spi_device_queue_trans/spi_device_get_trans_result
- as well as pre-transmit callbacks.
-
- Some info about the ILI9341: It has an C/D line, which is connected to a GPIO here. It expects this
- line to be low for a command and high for data. We use a pre-transmit callback here to control that
- line: every transaction has as the user-definable argument the needed state of the D/C line and just
- before the transaction is sent, the callback will set this line to the correct state.
-*/
-
-#define PIN_NUM_MISO CONFIG_HW_LCD_MISO_GPIO
-#define PIN_NUM_MOSI CONFIG_HW_LCD_MOSI_GPIO
-#define PIN_NUM_CLK  CONFIG_HW_LCD_CLK_GPIO
-#define PIN_NUM_CS   CONFIG_HW_LCD_CS_GPIO
-#define PIN_NUM_DC   CONFIG_HW_LCD_DC_GPIO
-#define PIN_NUM_RST  CONFIG_HW_LCD_RESET_GPIO
-#define PIN_NUM_BCKL CONFIG_HW_LCD_BL_GPIO
-
 SemaphoreHandle_t dispSem = NULL;
 SemaphoreHandle_t dispDoneSem = NULL;
-
-// TODO: replace display pause logic with task notify...
-static int tft_offset = 0;
-// don't start rendering framebuffer until we have a picture to display..
-static bool PAUSE_DISPLAY=true;
-
-/*
- The ILI9341 needs a bunch of command/argument values to be initialized. They are stored in this struct.
-*/
-typedef struct {
-    uint8_t cmd;
-    uint8_t data[16];
-    uint8_t databytes; //No of data in data; bit 7 = delay after set; 0xFF = end of cmds.
-} ili_init_cmd_t;
-
-static spi_device_handle_t spi;
-
-//Place data into DRAM. Constant data gets placed into DROM by default, which is not accessible by DMA.
-DRAM_ATTR static const ili_init_cmd_t ili_init_cmds[]={
-    {0xCF, {0x00, 0x83, 0X30}, 3},
-    {0xED, {0x64, 0x03, 0X12, 0X81}, 4},
-    {0xE8, {0x85, 0x01, 0x79}, 3},
-    {0xCB, {0x39, 0x2C, 0x00, 0x34, 0x02}, 5},
-    {0xF7, {0x20}, 1},
-    {0xEA, {0x00, 0x00}, 2},
-    {0xC0, {0x26}, 1},
-    {0xC1, {0x11}, 1},
-    {0xC5, {0x35, 0x3E}, 2},
-    {0xC7, {0xBE}, 1},
-    {0x36, {0x28}, 1},
-    {0x3A, {0x55}, 1},
-    {0xB1, {0x00, 0x1B}, 2},
-    {0xF2, {0x08}, 1},
-    {0x26, {0x01}, 1},
-    {0xE0, {0x1F, 0x1A, 0x18, 0x0A, 0x0F, 0x06, 0x45, 0X87, 0x32, 0x0A, 0x07, 0x02, 0x07, 0x05, 0x00}, 15},
-    {0XE1, {0x00, 0x25, 0x27, 0x05, 0x10, 0x09, 0x3A, 0x78, 0x4D, 0x05, 0x18, 0x0D, 0x38, 0x3A, 0x1F}, 15},
-    {0x2A, {0x00, 0x00, 0x00, 0xEF}, 4},
-    {0x2B, {0x00, 0x00, 0x01, 0x3f}, 4},
-    {0x2C, {0}, 0},
-    {0xB7, {0x07}, 1},
-    {0xB6, {0x0A, 0x82, 0x27, 0x00}, 4},
-    {0x11, {0}, 0x80},
-    {0x29, {0}, 0x80},
-    {0, {0}, 0xff},
-};
-
-//Send a command to the ILI9341. Uses spi_device_transmit, which waits until the transfer is complete.
-void ili_cmd(spi_device_handle_t spi, const uint8_t cmd)
-{
-    esp_err_t ret;
-    spi_transaction_t t;
-    memset(&t, 0, sizeof(t));       //Zero out the transaction
-    t.length=8;                     //Command is 8 bits
-    t.tx_buffer=&cmd;               //The data is the cmd itself
-    t.user=(void*)0;                //D/C needs to be set to 0
-    ret=spi_device_transmit(spi, &t);  //Transmit!
-    assert(ret==ESP_OK);            //Should have had no issues.
-}
-
-//Send data to the ILI9341. Uses spi_device_transmit, which waits until the transfer is complete.
-void ili_data(spi_device_handle_t spi, const uint8_t *data, int len)
-{
-    esp_err_t ret;
-    spi_transaction_t t;
-    if (len==0) return;             //no need to send anything
-    memset(&t, 0, sizeof(t));       //Zero out the transaction
-    t.length=len*8;                 //Len is in bytes, transaction length is in bits.
-    t.tx_buffer=data;               //Data
-    t.user=(void*)1;                //D/C needs to be set to 1
-    ret=spi_device_transmit(spi, &t);  //Transmit!
-    assert(ret==ESP_OK);            //Should have had no issues.
-}
-
-//This function is called (in irq context!) just before a transmission starts. It will
-//set the D/C line to the value indicated in the user field.
-void ili_spi_pre_transfer_callback(spi_transaction_t *t)
-{
-    int dc=(int)t->user;
-    gpio_set_level(PIN_NUM_DC, dc);
-}
-
-//Initialize the display
-void ili_init(spi_device_handle_t spi)
-{
-    int cmd=0;
-    //Initialize non-SPI GPIOs
-    gpio_set_direction(PIN_NUM_DC, GPIO_MODE_OUTPUT);
-    gpio_set_direction(PIN_NUM_RST, GPIO_MODE_OUTPUT);
-    gpio_set_direction(PIN_NUM_BCKL, GPIO_MODE_OUTPUT);
-    //Reset the display
-    gpio_set_level(PIN_NUM_RST, 0);
-    vTaskDelay(100 / portTICK_RATE_MS);
-    gpio_set_level(PIN_NUM_RST, 1);
-    vTaskDelay(100 / portTICK_RATE_MS);
-    //Send all the commands
-    while (ili_init_cmds[cmd].databytes!=0xff) {
-        ili_cmd(spi, ili_init_cmds[cmd].cmd);
-        ili_data(spi, ili_init_cmds[cmd].data, ili_init_cmds[cmd].databytes&0x1F);
-        if (ili_init_cmds[cmd].databytes&0x80) {
-            vTaskDelay(100 / portTICK_RATE_MS);
-        }
-        cmd++;
-    }
-    ///Enable backlight
-    gpio_set_level(PIN_NUM_BCKL, 1);
-}
-
-
-//To send a line we have to send a command, 2 data bytes, another command, 2 more data bytes and another command
-//before sending the line data itself; a total of 6 transactions. (We can't put all of this in just one transaction
-//because the D/C line needs to be toggled in the middle.)
-//This routine queues these commands up so they get sent as quickly as possible.
-static void send_line(spi_device_handle_t spi, int ypos, uint16_t *line)
-{
-    esp_err_t ret;
-    int x;
-    //Transaction descriptors. Declared static so they're not allocated on the stack; we need this memory even when this
-    //function is finished because the SPI driver needs access to it even while we're already calculating the next line.
-    static spi_transaction_t trans[6];
-
-    //In theory, it's better to initialize trans and data only once and hang on to the initialized
-    //variables. We allocate them on the stack, so we need to re-init them each call.
-    for (x=0; x<6; x++) {
-        memset(&trans[x], 0, sizeof(spi_transaction_t));
-        if ((x&1)==0) {
-            //Even transfers are commands
-            trans[x].length=8;
-            trans[x].user=(void*)0;
-        } else {
-            //Odd transfers are data
-            trans[x].length=8*4;
-            trans[x].user=(void*)1;
-        }
-        trans[x].flags=SPI_TRANS_USE_TXDATA;
-    }
-    trans[0].tx_data[0]=0x2A;           //Column Address Set
-    trans[1].tx_data[0]=0;              //Start Col High
-    trans[1].tx_data[1]=0;              //Start Col Low
-    trans[1].tx_data[2]=(320)>>8;       //End Col High
-    trans[1].tx_data[3]=(320)&0xff;     //End Col Low
-    trans[2].tx_data[0]=0x2B;           //Page address set
-    trans[3].tx_data[0]=ypos>>8;        //Start page high
-    trans[3].tx_data[1]=ypos&0xff;      //start page low
-    trans[3].tx_data[2]=(ypos+1)>>8;    //end page high
-    trans[3].tx_data[3]=(ypos+1)&0xff;  //end page low
-    trans[4].tx_data[0]=0x2C;           //memory write
-    trans[5].tx_buffer=line;            //finally send the line data
-    trans[5].length=320*2*8;            //Data length, in bits
-    trans[5].flags=0; //undo SPI_TRANS_USE_TXDATA flag
-
-    //Queue all transactions.
-    for (x=0; x<6; x++) {
-        ret=spi_device_queue_trans(spi, &trans[x], portMAX_DELAY);
-        assert(ret==ESP_OK);
-    }
-
-    //When we are here, the SPI driver is busy (in the background) getting the transactions sent. That happens
-    //mostly using DMA, so the CPU doesn't have much to do here. We're not going to wait for the transaction to
-    //finish because we may as well spend the time calculating the next line. When that is done, we can call
-    //send_line_finish, which will wait for the transfers to be done and check their status.
-}
-
-
-static void send_line_finish(spi_device_handle_t spi)
-{
-    spi_transaction_t *rtrans;
-    esp_err_t ret;
-    //Wait for all 6 transactions to be done and get back the results.
-    for (int x=0; x<6; x++) {
-        ret=spi_device_get_trans_result(spi, &rtrans, portMAX_DELAY);
-        assert(ret==ESP_OK);
-        //We could inspect rtrans now if we received any info back. The LCD is treated as write-only, though.
-    }
-}
-
-void spi_lcd_wait_finish() {
-  xSemaphoreTake(dispDoneSem, portMAX_DELAY);
-}
-
-void spi_lcd_send() {
-  xSemaphoreGive(dispSem);
-}
-
 SemaphoreHandle_t captureDoneSem = NULL;
 SemaphoreHandle_t captureSem = NULL;
 
@@ -280,8 +69,6 @@ void capture_request() {
 static EventGroupHandle_t espilicam_event_group;
 EventBits_t uxBits;
 const int MOVIEMODE_ON_BIT = BIT0;
-
-
 
 bool is_moviemode_on()
 {
@@ -300,10 +87,7 @@ static void set_moviemode(bool c) {
     }
 }
 
-static uint16_t lcd_delay_ms = 100;
-
 static void captureTask(void *pvParameters) {
-
   err_t err;
   bool movie_mode = false;
   xSemaphoreGive(captureDoneSem);
@@ -315,21 +99,12 @@ static void captureTask(void *pvParameters) {
 
      err = camera_run();
 
-     spi_lcd_send();
-     spi_lcd_wait_finish();
-
-     // reorder?
-     vTaskDelay(lcd_delay_ms / portTICK_RATE_MS);
-
      if (!movie_mode)
        xSemaphoreGive(captureDoneSem);
      // only return when LCD finished display .. sort of..
    } // end while(1)
 
 }
-
-#define ILI_WIDTH 320
-#define ILI_HEIGHT 240
 
 // CAMERA CONFIG
 
@@ -358,8 +133,8 @@ static camera_config_t config = {
 
 static camera_model_t camera_model;
 
-//#define CAMERA_PIXEL_FORMAT CAMERA_PF_RGB565
-#define CAMERA_PIXEL_FORMAT CAMERA_PF_YUV422
+#define CAMERA_PIXEL_FORMAT CAMERA_PF_RGB565
+//#define CAMERA_PIXEL_FORMAT CAMERA_PF_YUV422
 #define CAMERA_FRAME_SIZE CAMERA_FS_QVGA
 
 
@@ -409,118 +184,9 @@ static inline uint16_t fast_pascal_to_565(int Y, int U, int V) {
 
 //Warning: This gets squeezed into IRAM.
 volatile static uint32_t *currFbPtr __attribute__ ((aligned(4))) = NULL;
-volatile static uint32_t *currFbPtr2 __attribute__ ((aligned(4))) = NULL;
 
 inline uint8_t unpack(int byteNumber, uint32_t value) {
     return (value >> (byteNumber * 8));
-}
-
-static void push_framebuffer_to_tft(void *pvParameters) {
-  uint16_t line[2][320];
-  int x, y; //, frame=0;
-  //Indexes of the line currently being sent to the LCD and the line we're calculating.
-  int sending_line=-1;
-  int calc_line=0;
-
-  uint32_t* fbl = camera_get_fb();
-
-  int ili_width = 320;
-  int ili_height = 240;
-  int width = camera_get_fb_width();
-  int height =  camera_get_fb_height();
-  int max_fb_pos = width * height;
-  uint16_t pixel565 = 0;
-  uint16_t pixel565_2 = 0;
-  int current_byte_pos = 0, current_fb_pixel_pos = 0;
-
-  xSemaphoreGive(dispDoneSem);
-
-  while(1) {
-     //frame++;
-     xSemaphoreTake(dispSem, portMAX_DELAY);
- //		printf("Display task: frame.\n");
-     bool reset_loop = false;
-     for (y=0; y<ili_height; y++) {
-        //Calculate a line, operate on 2 pixels at a time...
-        for (x=0; x<ili_width; x+=2) {
-
-            // TODO: display pause logic cleanup
-/*
-            if (PAUSE_DISPLAY) {
-              while (PAUSE_DISPLAY) { vTaskDelay(30 / portTICK_RATE_MS); }
-              // reset FB, cam may have re-init'ed
-              fbl = camera_get_fb();
-              reset_loop = true;
-            }
-            if (reset_loop) break;
-*/
-
-            // wrap pixels around...
-            current_fb_pixel_pos = ((y*width)+x+tft_offset) % max_fb_pos;
-            // note, the next line is done to enable shifting the offset
-            // TODO: remove test mod %
-            current_byte_pos = current_fb_pixel_pos/2+(tft_offset % 4);
-
-            if (fbl != NULL) {
-              if (s_pixel_format == CAMERA_PF_YUV422) {
-                uint32_t long2px = 0;
-                uint8_t y1, y2, u, v;
-
-                long2px = fbl[current_byte_pos];
-                y1 = unpack(0,long2px);
-                v = unpack(1,long2px);;
-                y2 = unpack(2,long2px);
-                u = unpack(3,long2px);
-
-                // UYVY (Reverse order)
-                /*
-                y1 = fb[current_byte_pos+3];
-                v = fb[current_byte_pos+2];
-                y2 = fb[current_byte_pos+1];
-                u = fb[current_byte_pos];
-                */
-
-                pixel565 = fast_yuv_to_rgb565(y1,u,v);
-                pixel565_2 = fast_yuv_to_rgb565(y2,u,v);
-                // swap bytes for ILI
-                line[calc_line][x]= __bswap_16(pixel565);
-                line[calc_line][x+1]= __bswap_16(pixel565_2);
-              } else {
-                // rgb565 direct from OV7670 to ILI9341
-                // best to swap bytes here instead of bswap
-                uint32_t long2px = 0;
-                uint8_t y1, y2, u, v;
-
-                long2px = fbl[current_byte_pos];
-                pixel565 =  (unpack(3,long2px) << 8) | unpack(2,long2px);
-                pixel565_2 = (unpack(1,long2px) << 8) | unpack(0,long2px);
-
-                /*
-                pixel565 =  (fb[current_byte_pos] << 8) |  fb[current_byte_pos+1]; //(fb[currBytePos] & 0xFF00 >> 8) | (p565 = fb[currBytePos+1] & 0x00FF);
-                pixel565_2 = (fb[current_byte_pos+2] << 8) |  fb[current_byte_pos+3];
-                */
-                line[calc_line][x]= pixel565;
-                line[calc_line][x+1]= pixel565_2;
-              }
-            }
-        }
-        //Finish up the sending process of the previous line, if any
-        if (sending_line!=-1) send_line_finish(spi);
-        //Swap sending_line and calc_line
-        sending_line=calc_line;
-        calc_line=(calc_line==1)?0:1;
-        //Send the line we currently calculated.
-        send_line(spi, y, line[sending_line]);
-        //The line is queued up for sending now; the actual sending happens in the
-        //background. We can go on to calculate the next line as long as we do not
-        //touch line[sending_line]; the SPI sending process is still reading from that.
-      } // end for (y=0; y<ili_height; y++)
-
-      // TODO: check that line is actually sent before giving semaphore!
-      vTaskDelay(10 / portTICK_RATE_MS);
-
-      xSemaphoreGive(dispDoneSem);
-  } // end while(1)
 }
 
 // camera code
@@ -555,21 +221,19 @@ static char telnet_cmd_response_buff[RESPONSE_BUFFER_LEN];
 static char telnet_cmd_buffer[CMD_BUFFER_LEN];
 
 static void handle_camera_config_chg(bool reinit_reqd) {
-  if (reinit_reqd) {
-              ESP_LOGD(TAG, "Reconfiguring camera...");
-              PAUSE_DISPLAY = true;
-              esp_err_t err;
-              vTaskDelay(100 / portTICK_RATE_MS);
-              err = reset_pixformat();
-              config.pixel_format = s_pixel_format;
-              err = camera_init(&config);
-              if (err != ESP_OK) {
-                  ESP_LOGE(TAG, "Camera init failed with error 0x%x", err);
-                  //return;
-              }
-              return;
-              vTaskDelay(100 / portTICK_RATE_MS);
-              PAUSE_DISPLAY = false;
+    if (reinit_reqd) {
+    ESP_LOGD(TAG, "Reconfiguring camera...");
+    esp_err_t err;
+    vTaskDelay(100 / portTICK_RATE_MS);
+    err = reset_pixformat();
+    config.pixel_format = s_pixel_format;
+    err = camera_init(&config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Camera init failed with error 0x%x", err);
+        //return;
+    }
+    return;
+    vTaskDelay(100 / portTICK_RATE_MS);
     }
 }
 
@@ -592,26 +256,6 @@ static int help_cb(const sarg_result *res)
     free(buf);
     return 0;
 }
-
-
-/*
-
-void captureTask( void * pvParameters ) {
-    while(1) {
-     while (movie_mode) {
-      PAUSE_DISPLAY = true;
-      camera_run();
-      PAUSE_DISPLAY = false;
-      spi_lcd_send();
-      spi_lcd_wait_finish();
-      vTaskDelay(30 / portTICK_RATE_MS);
-     }
-     vTaskDelay(10 / portTICK_RATE_MS);
-   }
-   vTaskDelete(NULL);
-}
-*/
-
 
 static int sys_stats_cb(const sarg_result *res)
 {
@@ -656,7 +300,6 @@ static int  videomode_cb(const sarg_result *res) {
       if (bval == 0) movie_mode = false;
       else if (bval == 1) movie_mode = true;
       else {
-      (lcd_delay_ms = res->int_val);
       movie_mode = true;
       }
        // set event group...
@@ -991,37 +634,6 @@ static void telnetTask(void *data) {
   vTaskDelete(NULL);
 }
 
-
-
-// 8-bit logic - ref.
-/*
-static void convert_yuv_line_to_565(uint8_t *srcline, uint8_t *destline, int byte_len) {
-
-  uint16_t pixel565 = 0;
-  uint16_t pixel565_2 = 0;
-  for (int current_byte_pos = 0; current_byte_pos < byte_len; current_byte_pos += 4)
-  {
-       uint8_t y1, y2, u, v;
-       y1 = srcline[current_byte_pos+3];
-       v = srcline[current_byte_pos+2];
-       y2 = srcline[current_byte_pos+1];
-       u = srcline[current_byte_pos];
-       pixel565 = fast_yuv_to_rgb565(y1,u,v);
-       //pixel565 = __bswap_16(pixel565);
-       pixel565_2 = fast_yuv_to_rgb565(y2,u,v);
-       //pixel565 = __bswap_16(pixel565_2);
-       destline[0] = pixel565 & 0xFF00 >> 8;
-       destline[1] = pixel565 & 0xFF;
-       //memcpy(destline, &pixel565, sizeof(uint16_t));
-       destline +=2;
-       destline[0] = pixel565_2 & 0xFF00 >> 8;
-       destline[1] = pixel565_2 & 0xFF;
-       //memcpy(destline, &pixel565_2, sizeof(uint16_t));
-       destline +=2;
-  }
-}
-*/
-
 static void convert_fb32bit_line_to_bmp565(uint32_t *srcline, uint8_t *destline, const camera_pixelformat_t format) {
 
   uint16_t pixel565 = 0;
@@ -1105,18 +717,8 @@ static void http_server_netconn_serve(struct netconn *conn)
                 while(err == ERR_OK) {
                     ESP_LOGD(TAG, "Capture frame");
 
-/*
-                    PAUSE_DISPLAY = true;
-                    err = camera_run();
-                    PAUSE_DISPLAY = false;
-*/
-
                     capture_request();
                     capture_wait_finish();
-
-
-                    //spi_lcd_send();
-                    //spi_lcd_wait_finish();
 
                     if (err != ESP_OK) {
                         ESP_LOGD(TAG, "Camera capture failed with error = %d", err);
@@ -1192,7 +794,6 @@ static void http_server_netconn_serve(struct netconn *conn)
                     }
                 } else if (s_pixel_format == CAMERA_PF_YUV422) {
                   if (memcmp(&buf[5], "bmp", 3) == 0) {
-                      //PAUSE_DISPLAY = true;
                       // send YUV converted to 565 2bpp for now...
                       netconn_write(conn, http_bitmap_hdr, sizeof(http_bitmap_hdr) - 1, NETCONN_NOCOPY);
                       char *bmp = bmp_create_header565(camera_get_fb_width(), camera_get_fb_height());
@@ -1275,25 +876,6 @@ static void http_server(void *pvParameters)
     netconn_delete(conn);
 }
 
-static spi_bus_config_t buscfg={
-    .miso_io_num=PIN_NUM_MISO,
-    .mosi_io_num=PIN_NUM_MOSI,
-    .sclk_io_num=PIN_NUM_CLK,
-    .quadwp_io_num=-1,
-    .quadhd_io_num=-1
-};
-
-static spi_device_interface_config_t devcfg={
-//    .clock_speed_hz=10000000,               //Clock out at 10 MHz - too slow
-    .clock_speed_hz=20000000, // works well... but can it hold out for 10+ mins?
-//    .clock_speed_hz=26000000,               //Clock out at 26 MHz. Yes, that's heavily overclocked.
-    .mode=0,                                //SPI mode 0
-    .spics_io_num=PIN_NUM_CS,               //CS pin
-    .queue_size=7,                          //We want to be able to queue 7 transactions at a time
-    .pre_cb=ili_spi_pre_transfer_callback,  //Specify pre-transfer callback to handle D/C line
-};
-
-
 // I (11781) ESPILICAM: Free heap: 214720
 // I (11781) ESPILICAM: Free (largest free blocks) 8bit-capable memory : 113804K, 32-bit capable memory 113804K
 // I (11781) ESPILICAM: Free (min free size) 8bit-capable memory : 212956K, 32-bit capable memory 272940K
@@ -1333,15 +915,6 @@ void app_main()
         return;
     }
 
-/*
-    heap_mem_log();
-    ESP_LOGI(TAG, "Allocating Frame Buffer 2 memory...");
-    currFbPtr2=heap_caps_malloc(320*240, MALLOC_CAP_32BIT);
-    if (currFbPtr2 == NULL) {
-        ESP_LOGE(TAG, "Not enough memory to allocate 2");
-        return;
-    }
-*/
     heap_mem_log();
 
     vTaskDelay(1000 / portTICK_RATE_MS);
@@ -1366,20 +939,7 @@ void app_main()
 
     esp_err_t ret;
 
-    //Initialize the SPI bus
-    //ESP_LOGI(TAG, "Call spi_bus_initialize");
-    ret=spi_bus_initialize(HSPI_HOST, &buscfg, 1);
-    assert(ret==ESP_OK);
-    //Attach the LCD to the SPI bus
-    //ESP_LOGI(TAG, "Call spi_bus_add_device");
-    ret=spi_bus_add_device(HSPI_HOST, &devcfg, &spi);
-    assert(ret==ESP_OK);
-    //Initialize the LCD
-    //ESP_LOGI(TAG, "Call ili_init");
-    ili_init(spi);
-
     // camera init
-
     esp_err_t err = camera_probe(&config, &camera_model);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Camera probe failed with error 0x%x", err);
@@ -1420,8 +980,6 @@ void app_main()
     espilicam_event_group = xEventGroupCreate();
 
     xSemaphoreGive(dispDoneSem);
-    ESP_LOGD(TAG, "Starting ILI9341 display task...");
-    xTaskCreatePinnedToCore(&push_framebuffer_to_tft, "push_framebuffer_to_tft", 4096, NULL, 5, NULL,1);
 
     captureSem=xSemaphoreCreateBinary();
     captureDoneSem=xSemaphoreCreateBinary();
